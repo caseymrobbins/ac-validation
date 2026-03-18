@@ -70,10 +70,27 @@ ac-validation/
   results/                        # Saved metrics, checkpoints, figures
 ```
 
-## Quick Start (Google Colab)
+## Runtime Compatibility
+
+This project currently depends on an older AI Economist stack that expects
+Python 3.10/3.11-era packages, especially `gym==0.21` and `ray==2.3.0`.
+Current Google Colab runtimes use Python 3.12, so notebook 01 will not install
+cleanly there.
+
+Execution checklist: see `EXECUTION_CHECKLIST.md` for the recommended order of
+operations and gating criteria before running paid training jobs.
+Fork contract: see `AI_ECONOMIST_FORK_CONTRACT.md` for what must be implemented
+inside the AI Economist fork before SUM/NASH/JAM training runs are valid.
+
+Use one of these instead:
+
+- Kaggle notebook runtime with Python 3.10/3.11
+- Local environment with Python 3.10 or 3.11
+
+## Quick Start
 
 ```python
-# 1. Install
+# 1. Create a Python 3.10/3.11 environment, then install
 !pip install git+https://github.com/salesforce/ai-economist.git
 !pip install 'ray[rllib]==2.3.0' torch
 

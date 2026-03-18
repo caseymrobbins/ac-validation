@@ -1,5 +1,8 @@
 # Agency Calculus Empirical Validation
 # AI Economist + RLlib environment
+# NOTE: This stack targets Python 3.10/3.11. It is not compatible with
+# current Colab Python 3.12 runtimes because gym==0.21 and ray==2.3.0 do not
+# publish usable wheels there, and ai-economist pulls older transitive pins.
 
 # Core AI Economist (install from GitHub)
 # pip install git+https://github.com/salesforce/ai-economist.git

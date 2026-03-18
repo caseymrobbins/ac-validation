@@ -45,6 +45,25 @@ def geometric_mean(values: List[float]) -> float:
     return float(np.prod(arr) ** (1.0 / len(arr)))
 
 
+def normalize_inventory(inventory: Optional[Dict[str, Any]]) -> Dict[str, float]:
+    """
+    Canonicalize inventory keys to lowercase resource names.
+
+    AI Economist state sometimes exposes title-cased keys (`Wood`, `Stone`)
+    while the POLI helpers expect lowercase names. Normalizing once here keeps
+    downstream metric computation consistent.
+    """
+    normalized = {"wood": 0.0, "stone": 0.0}
+    if not isinstance(inventory, dict):
+        return normalized
+
+    for key, value in inventory.items():
+        key_lower = str(key).lower()
+        if key_lower in normalized:
+            normalized[key_lower] = float(value)
+    return normalized
+
+
 # ---------------------------------------------------------------------------
 # POLI dimension extractors
 # ---------------------------------------------------------------------------
@@ -70,6 +89,7 @@ def compute_prerequisites(
         max_inventory_value: Normalization ceiling for inventory value.
         stone_price, wood_price: Prices for inventory valuation.
     """
+    inventory = normalize_inventory(inventory)
     inv_value = (
         inventory.get("stone", 0) * stone_price
         + inventory.get("wood", 0) * wood_price
@@ -254,19 +274,15 @@ def extract_agent_state_from_obs(
             if hasattr(endow, "__len__") and len(endow) >= 1:
                 state["coin"] = float(endow[0])
                 if len(endow) >= 3:
-                    state["inventory"] = {
+                    state["inventory"] = normalize_inventory({
                         "wood": float(endow[1]),
                         "stone": float(endow[2]),
-                    }
+                    })
 
         # Inventory
         if "inventory" in agent_obs:
             inv = agent_obs["inventory"]
-            if isinstance(inv, dict):
-                state["inventory"] = {
-                    k: float(v) for k, v in inv.items()
-                    if k in ("wood", "stone", "Wood", "Stone")
-                }
+            state["inventory"] = normalize_inventory(inv)
 
     # Use env_state for richer extraction when available
     if env_state is not None:
@@ -274,9 +290,7 @@ def extract_agent_state_from_obs(
         if "coin" in agent_state:
             state["coin"] = float(agent_state["coin"])
         if "inventory" in agent_state:
-            state["inventory"] = {
-                k: float(v) for k, v in agent_state["inventory"].items()
-            }
+            state["inventory"] = normalize_inventory(agent_state["inventory"])
         if "income_change" in agent_state:
             state["income_change"] = float(agent_state["income_change"])
 

@@ -7,7 +7,7 @@ Architecture:
   - 4 worker agents + 1 planner (AI Economist default)
   - PPO via RLlib
   - Worker rewards: individual utility (unchanged across conditions)
-  - Planner reward: overridden per condition (SUM/NASH/JAM)
+  - Planner reward: must be overridden inside the AI Economist fork/env
   - Evaluation: every EVAL_INTERVAL steps, run EVAL_EPISODES episodes
   - Logging: MetricsLogger saves to results/
 """
@@ -24,9 +24,16 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
-from ac_rewards import get_reward_fn
-from poli_agency import compute_all_agency_scores
-from metrics import compute_episode_metrics, aggregate_metrics, MetricsLogger
+try:
+    from .ac_rewards import get_reward_fn
+    from .experiment_specs import validate_condition_name
+    from .poli_agency import compute_all_agency_scores
+    from .metrics import compute_episode_metrics, aggregate_metrics, MetricsLogger
+except ImportError:
+    from ac_rewards import get_reward_fn
+    from experiment_specs import validate_condition_name
+    from poli_agency import compute_all_agency_scores
+    from metrics import compute_episode_metrics, aggregate_metrics, MetricsLogger
 
 # ---------------------------------------------------------------------------
 # Training constants
@@ -42,7 +49,7 @@ ROLLOUT_FRAGMENT_LENGTH = 200
 
 # Environment configuration (shared across all conditions)
 BASE_ENV_CONFIG = {
-    'scenario_name': 'simple_wood_and_stone/simple_wood_and_stone',
+    'scenario_name': 'layout_from_file/simple_wood_and_stone',
     'components': [
         {'Build': {'skill_dist': 'pareto', 'payment_max_skill_multiplier': 3}},
         {'ContinuousDoubleAuction': {'max_num_orders': 5}},
@@ -63,23 +70,31 @@ BASE_ENV_CONFIG = {
 
 
 # ---------------------------------------------------------------------------
-# Environment + reward injection
+# Environment + reward analysis helpers
 # ---------------------------------------------------------------------------
 
-def make_env(seed: int = 0):
+def make_env(seed: int = 0, env_config_overrides: Optional[Dict[str, Any]] = None):
     """Create a fresh AI Economist environment instance."""
     from ai_economist import foundation
-    env = foundation.make_env_instance(**BASE_ENV_CONFIG)
+    env_config = dict(BASE_ENV_CONFIG)
+    if env_config_overrides:
+        env_config.update(env_config_overrides)
+    env = foundation.make_env_instance(**env_config)
     env.seed(seed)
     return env
 
 
 def compute_planner_reward_from_env(env, condition: str) -> float:
     """
-    Compute the social planner reward from the current environment state.
+    Compute the planner reward implied by the current environment state.
 
     Utility proxy: per-agent coin holdings (end-of-episode metric).
     We ensure utilities are > 0 for log-based objectives.
+
+    NOTE:
+        This helper is for analysis and sanity checks only. It does not change
+        the planner's training reward by itself. The real reward swap must
+        happen in the AI Economist scenario/env code path.
     """
     reward_fn = get_reward_fn(condition)
     utilities = []
@@ -110,6 +125,17 @@ def extract_wealth(env) -> List[float]:
         stone = float(getattr(agent, 'inventory', {}).get('Stone', 0))
         wealth.append(coin + wood + stone)
     return wealth
+
+
+def extract_inventory_values(env) -> List[float]:
+    """Extract per-agent inventory-only totals for concentration metrics."""
+    inventory_values = []
+    for i in range(N_AGENTS):
+        agent = env.get_agent(str(i))
+        wood = float(getattr(agent, 'inventory', {}).get('Wood', 0))
+        stone = float(getattr(agent, 'inventory', {}).get('Stone', 0))
+        inventory_values.append(wood + stone)
+    return inventory_values
 
 
 def extract_tax_rates(env) -> List[float]:
@@ -195,6 +221,7 @@ def run_eval_episodes(env, policy_dict: dict, condition: str,
         # End of episode: compute metrics
         utilities = extract_utilities(env)
         wealth = extract_wealth(env)
+        inventory_values = extract_inventory_values(env)
         tax_rates = extract_tax_rates(env)
         agency_scores_raw = compute_all_agency_scores(N_AGENTS, obs)
         agency_scores = [a['agency'] for a in agency_scores_raw]
@@ -203,7 +230,7 @@ def run_eval_episodes(env, policy_dict: dict, condition: str,
             utilities=utilities,
             agency_scores=agency_scores,
             wealth_values=wealth,
-            inventory_values=wealth,  # simplified: use wealth as inventory proxy
+            inventory_values=inventory_values,
             tax_rates=tax_rates,
             floor_action_history=floor_actions,
         )
@@ -228,7 +255,8 @@ def run_training(
     Full training run for one condition + seed.
 
     Args:
-        condition: 'sum', 'nash', or 'jam'
+        condition: Experiment condition name (for example 'sum', 'nash',
+            'jam', 'jam_epsilon', or 'jam_softmin')
         seed: Random seed (0-4)
         total_timesteps: Total training steps
         eval_interval: Steps between evaluations
@@ -238,6 +266,8 @@ def run_training(
     Returns:
         MetricsLogger with full training history.
     """
+    condition = validate_condition_name(condition)
+
     import ray
     from ray.rllib.algorithms.ppo import PPO
 
@@ -259,39 +289,50 @@ def run_training(
     try:
         from ai_economist.training.rllib_wrapper import RLlibEnvWrapper
         env_class = RLlibEnvWrapper
+        effective_env_config = dict(
+            BASE_ENV_CONFIG,
+            planner_reward_type=condition,
+            planner_utility_source='coin_endowment',
+        )
         env_config = {
-            'env_config_dict': BASE_ENV_CONFIG,
+            'env_config_dict': effective_env_config,
             'num_envs_per_worker': 1,
         }
     except ImportError:
         # Fallback: use foundation directly
         from ai_economist import foundation
         env_class = None
-        env_config = BASE_ENV_CONFIG
+        effective_env_config = dict(
+            BASE_ENV_CONFIG,
+            planner_reward_type=condition,
+            planner_utility_source='coin_endowment',
+        )
+        env_config = effective_env_config
 
     if env_class is None:
         raise RuntimeError(
             'RLlibEnvWrapper not available. Run notebook 01 to install ai-economist.'
         )
 
-    # We inject planner reward via a custom callback
+    # This callback logs what the AC planner reward would be for the current
+    # env state. It does not replace the planner's training signal.
     from ray.rllib.algorithms.callbacks import DefaultCallbacks
 
     class ACCallbacks(DefaultCallbacks):
-        """Injects Agency Calculus planner reward after each episode."""
+        """Logs Agency Calculus planner reward candidates after each episode."""
 
         def on_episode_end(self, worker, base_env, policies, episode, **kwargs):
-            # Override planner reward with our condition-specific objective
+            # Record condition-specific reward diagnostics for later comparison.
             envs = base_env.get_sub_environments()
             for env_inst in envs:
                 try:
                     raw_env = env_inst.env if hasattr(env_inst, 'env') else env_inst
                     planner_r = compute_planner_reward_from_env(raw_env, condition)
-                    # Store as custom metric — actual reward override requires
-                    # env-level modification (see notebook 04 for full approach)
+                    # Actual reward replacement requires env/scenario changes in
+                    # the AI Economist fork; this repo only logs diagnostics.
                     episode.custom_metrics['planner_ac_reward'] = planner_r
                     episode.custom_metrics['floor_utility'] = min(extract_utilities(raw_env))
-                except Exception as e:
+                except Exception:
                     pass  # Don't crash training on metric errors
 
     trainer_config = {
@@ -313,7 +354,7 @@ def run_training(
     }
 
     trainer = PPO(config=trainer_config)
-    env = make_env(seed=seed)
+    env = make_env(seed=seed, env_config_overrides=effective_env_config)
 
     timesteps_trained = 0
     eval_count = 0
@@ -376,7 +417,7 @@ def run_condition(
     Run all seeds for one condition sequentially.
 
     Args:
-        condition: 'sum', 'nash', or 'jam'
+        condition: Experiment condition name.
         seeds: List of seeds (default: [0, 1, 2, 3, 4])
         total_timesteps: Steps per seed
         results_dir: Output directory
@@ -384,6 +425,8 @@ def run_condition(
     Returns:
         List of MetricsLogger, one per seed.
     """
+    condition = validate_condition_name(condition)
+
     if seeds is None:
         seeds = list(range(N_SEEDS))
 

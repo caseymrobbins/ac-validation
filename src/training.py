@@ -80,8 +80,31 @@ def make_env(seed: int = 0, env_config_overrides: Optional[Dict[str, Any]] = Non
     if env_config_overrides:
         env_config.update(env_config_overrides)
     env = foundation.make_env_instance(**env_config)
-    env.seed(seed)
+    # AI Economist requires strictly positive integer seeds.
+    normalized_seed = int(seed)
+    if normalized_seed <= 0:
+        normalized_seed = abs(normalized_seed) + 1
+    env.seed(normalized_seed)
     return env
+
+
+def _agent_coin_endowment(agent) -> float:
+    """Safely read an agent's current Coin endowment from AI Economist state."""
+    try:
+        return float(agent.total_endowment("Coin"))
+    except Exception:
+        inventory = getattr(agent, "inventory", {}) or {}
+        escrow = getattr(agent, "escrow", {}) or {}
+        return float(inventory.get("Coin", 0.0)) + float(escrow.get("Coin", 0.0))
+
+
+def _agent_inventory_amount(agent, resource: str) -> float:
+    """Safely read an agent inventory resource amount."""
+    try:
+        return float(agent.inventory.get(resource, 0.0))
+    except Exception:
+        inventory = getattr(agent, "inventory", {}) or {}
+        return float(inventory.get(resource, 0.0))
 
 
 def compute_planner_reward_from_env(env, condition: str) -> float:
@@ -100,7 +123,7 @@ def compute_planner_reward_from_env(env, condition: str) -> float:
     utilities = []
     for i in range(N_AGENTS):
         agent = env.get_agent(str(i))
-        coin = float(getattr(agent, 'total_endowment', {}).get('Coin', 1.0))
+        coin = _agent_coin_endowment(agent)
         utilities.append(max(coin, 1e-8))
     return reward_fn(utilities)
 
@@ -110,7 +133,7 @@ def extract_utilities(env) -> List[float]:
     utils = []
     for i in range(N_AGENTS):
         agent = env.get_agent(str(i))
-        coin = float(getattr(agent, 'total_endowment', {}).get('Coin', 1.0))
+        coin = _agent_coin_endowment(agent)
         utils.append(max(coin, 1e-8))
     return utils
 
@@ -120,9 +143,9 @@ def extract_wealth(env) -> List[float]:
     wealth = []
     for i in range(N_AGENTS):
         agent = env.get_agent(str(i))
-        coin = float(getattr(agent, 'total_endowment', {}).get('Coin', 0.0))
-        wood = float(getattr(agent, 'inventory', {}).get('Wood', 0))
-        stone = float(getattr(agent, 'inventory', {}).get('Stone', 0))
+        coin = _agent_coin_endowment(agent)
+        wood = _agent_inventory_amount(agent, 'Wood')
+        stone = _agent_inventory_amount(agent, 'Stone')
         wealth.append(coin + wood + stone)
     return wealth
 
@@ -132,8 +155,8 @@ def extract_inventory_values(env) -> List[float]:
     inventory_values = []
     for i in range(N_AGENTS):
         agent = env.get_agent(str(i))
-        wood = float(getattr(agent, 'inventory', {}).get('Wood', 0))
-        stone = float(getattr(agent, 'inventory', {}).get('Stone', 0))
+        wood = _agent_inventory_amount(agent, 'Wood')
+        stone = _agent_inventory_amount(agent, 'Stone')
         inventory_values.append(wood + stone)
     return inventory_values
 
@@ -150,6 +173,50 @@ def extract_tax_rates(env) -> List[float]:
         return rates
     except Exception:
         return [0.0] * N_AGENTS
+
+
+def detect_training_device() -> Dict[str, Any]:
+    """
+    Detect whether PPO should request a GPU.
+
+    Behavior:
+      - Default: use 1 GPU when torch reports CUDA is available.
+      - Override with AC_VALIDATION_USE_GPU=0/1.
+    """
+    override = os.environ.get('AC_VALIDATION_USE_GPU')
+
+    try:
+        import torch
+    except Exception as exc:
+        return {
+            'num_gpus': 0,
+            'device': 'cpu',
+            'reason': f'torch import failed: {exc}',
+        }
+
+    if override is not None:
+        use_gpu = override.strip().lower() not in {'0', 'false', 'no', ''}
+        reason = f'AC_VALIDATION_USE_GPU={override}'
+    else:
+        use_gpu = bool(torch.cuda.is_available())
+        reason = 'torch.cuda.is_available()'
+
+    if use_gpu:
+        try:
+            gpu_name = torch.cuda.get_device_name(0)
+        except Exception:
+            gpu_name = 'CUDA GPU'
+        return {
+            'num_gpus': 1,
+            'device': gpu_name,
+            'reason': reason,
+        }
+
+    return {
+        'num_gpus': 0,
+        'device': 'cpu',
+        'reason': reason,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -183,25 +250,33 @@ def run_eval_episodes(env, policy_dict: dict, condition: str,
             actions = {}
             for i in range(N_AGENTS):
                 agent_id = str(i)
-                if agent_id in policy_dict:
-                    action, _, _ = policy_dict[agent_id].compute_single_action(
-                        obs.get(agent_id, np.zeros(1))
+                if 'worker' in policy_dict:
+                    agent_obs = obs.get(agent_id, {})
+                    if isinstance(agent_obs, dict) and 'flat' in agent_obs:
+                        agent_obs = agent_obs['flat']
+                    action, _, _ = policy_dict['worker'].compute_single_action(
+                        agent_obs
                     )
+                    action = int(np.asarray(action).item())
                 else:
                     agent = env.get_agent(agent_id)
-                    action = {k: np.random.randint(0, v)
-                              for k, v in agent.action_spaces.items()}
+                    action = int(np.random.randint(0, agent.action_spaces))
                 actions[agent_id] = action
 
             # Planner action
-            if 'p' in policy_dict:
-                p_action, _, _ = policy_dict['p'].compute_single_action(
-                    obs.get('p', np.zeros(1))
+            if 'planner' in policy_dict:
+                planner_obs = obs.get('p', {})
+                if isinstance(planner_obs, dict) and 'flat' in planner_obs:
+                    planner_obs = planner_obs['flat']
+                p_action, _, _ = policy_dict['planner'].compute_single_action(
+                    planner_obs
                 )
+                if isinstance(p_action, np.ndarray):
+                    p_action = p_action.tolist()
+                p_action = [int(x) for x in p_action]
             else:
                 planner = env.get_agent('p')
-                p_action = {k: np.random.randint(0, v)
-                            for k, v in planner.action_spaces.items()}
+                p_action = [int(np.random.randint(0, n)) for n in planner.action_spaces]
             actions['p'] = p_action
 
             obs, rewards, done, info = env.step(actions)
@@ -279,40 +354,132 @@ def run_training(
         print(f'Total steps: {total_timesteps:,}  Eval every: {eval_interval:,}')
         print(f'{"="*60}')
 
+    device_info = detect_training_device()
+    ray_num_cpus = max(2, min(8, os.cpu_count() or 2))
+
+    if verbose:
+        print(
+            f'Execution device: {device_info["device"]} '
+            f'(num_gpus={device_info["num_gpus"]}, source={device_info["reason"]})'
+        )
+
     # Initialize Ray if needed
     if not ray.is_initialized():
-        ray.init(ignore_reinit_error=True, num_cpus=2, log_to_driver=False)
+        ray.init(
+            ignore_reinit_error=True,
+            num_cpus=ray_num_cpus,
+            num_gpus=device_info['num_gpus'],
+            log_to_driver=False,
+        )
 
     logger = MetricsLogger(condition=condition, seed=seed)
 
     # Build trainer config
-    try:
-        from ai_economist.training.rllib_wrapper import RLlibEnvWrapper
-        env_class = RLlibEnvWrapper
-        effective_env_config = dict(
-            BASE_ENV_CONFIG,
-            planner_reward_type=condition,
-            planner_utility_source='coin_endowment',
-        )
-        env_config = {
-            'env_config_dict': effective_env_config,
-            'num_envs_per_worker': 1,
-        }
-    except ImportError:
-        # Fallback: use foundation directly
-        from ai_economist import foundation
-        env_class = None
-        effective_env_config = dict(
-            BASE_ENV_CONFIG,
-            planner_reward_type=condition,
-            planner_utility_source='coin_endowment',
-        )
-        env_config = effective_env_config
+    effective_env_config = dict(
+        BASE_ENV_CONFIG,
+        planner_reward_type=condition,
+        planner_utility_source='coin_endowment',
+        # RLlib's default torch vision models do not handle the raw [2, 25, 25]
+        # map tensor shape cleanly here. Use flattened observations for PPO.
+        flatten_observations=True,
+    )
 
-    if env_class is None:
-        raise RuntimeError(
-            'RLlibEnvWrapper not available. Run notebook 01 to install ai-economist.'
-        )
+    try:
+        from gymnasium.spaces import Box, Dict as SpaceDict, Discrete, MultiDiscrete
+    except ImportError:
+        from gym.spaces import Box, Dict as SpaceDict, Discrete, MultiDiscrete
+    from ray.rllib.env.multi_agent_env import MultiAgentEnv
+
+    sample_env = make_env(seed=seed, env_config_overrides=effective_env_config)
+    sample_obs = sample_env.reset()
+    worker_flat_obs = np.asarray(sample_obs['0']['flat'], dtype=np.float32)
+    planner_flat_obs = np.asarray(sample_obs['p']['flat'], dtype=np.float32)
+    worker_obs_space = Box(
+        low=-1e20, high=1e20, shape=worker_flat_obs.shape, dtype=np.float32
+    )
+    planner_obs_space = Box(
+        low=-1e20, high=1e20, shape=planner_flat_obs.shape, dtype=np.float32
+    )
+    worker_action_space = Discrete(int(sample_env.get_agent('0').action_spaces))
+    planner_action_space = MultiDiscrete(
+        np.array(sample_env.get_agent('p').action_spaces, dtype=np.int64)
+    )
+
+    def _policy_obs(agent_obs):
+        if isinstance(agent_obs, dict) and 'flat' in agent_obs:
+            return np.asarray(agent_obs['flat'], dtype=np.float32)
+        return np.asarray(agent_obs, dtype=np.float32)
+
+    class FoundationMultiAgentEnv(MultiAgentEnv):
+        """Minimal RLlib-compatible wrapper for AI Economist PPO training."""
+
+        def __init__(self, config=None):
+            super().__init__()
+            config = dict(config or {})
+            seed_override = int(config.pop('seed', seed))
+            self.env = make_env(seed=seed_override, env_config_overrides=config)
+            self._agent_ids = {str(i) for i in range(self.env.n_agents)} | {'p'}
+            self.observation_spaces = {
+                **{str(i): worker_obs_space for i in range(self.env.n_agents)},
+                'p': planner_obs_space,
+            }
+            self.action_spaces = {
+                **{str(i): worker_action_space for i in range(self.env.n_agents)},
+                'p': planner_action_space,
+            }
+            # Expose spaces in RLlib's preferred multi-agent format.
+            self.observation_space = SpaceDict(self.observation_spaces)
+            self.action_space = SpaceDict(self.action_spaces)
+            self._obs_space_in_preferred_format = True
+            self._action_space_in_preferred_format = True
+
+        def reset(self, *, seed=None, options=None):
+            if seed is not None:
+                self.env.seed(seed)
+            obs = self.env.reset()
+            flat_obs = {
+                agent_id: _policy_obs(agent_obs) for agent_id, agent_obs in obs.items()
+            }
+            infos = {agent_id: {} for agent_id in flat_obs}
+            return flat_obs, infos
+
+        def step(self, action_dict):
+            formatted_actions = {}
+            for i in range(self.env.n_agents):
+                aid = str(i)
+                action = action_dict.get(aid, 0)
+                if isinstance(action, np.ndarray):
+                    action = action.item()
+                elif isinstance(action, (list, tuple)):
+                    action = action[0]
+                formatted_actions[aid] = int(action)
+
+            planner_action = action_dict.get('p', [0] * len(planner_action_space.nvec))
+            if isinstance(planner_action, np.ndarray):
+                planner_action = planner_action.tolist()
+            elif not isinstance(planner_action, (list, tuple)):
+                planner_action = [planner_action]
+            formatted_actions['p'] = [int(x) for x in planner_action]
+            obs, rewards, done, info = self.env.step(formatted_actions)
+            flat_obs = {agent_id: _policy_obs(agent_obs) for agent_id, agent_obs in obs.items()}
+            terminateds = {agent_id: bool(done.get(agent_id, False)) for agent_id in flat_obs}
+            terminateds['__all__'] = bool(done.get('__all__', False))
+            truncateds = {agent_id: False for agent_id in flat_obs}
+            truncateds['__all__'] = False
+            infos = {agent_id: info.get(agent_id, {}) for agent_id in flat_obs}
+            return flat_obs, rewards, terminateds, truncateds, infos
+
+        def get_observation_space(self, agent_id):
+            return planner_obs_space if agent_id == 'p' else worker_obs_space
+
+        def get_action_space(self, agent_id):
+            return planner_action_space if agent_id == 'p' else worker_action_space
+
+    def policy_mapping_fn(agent_id, *args, **kwargs):
+        return 'planner' if agent_id == 'p' else 'worker'
+
+    env_class = FoundationMultiAgentEnv
+    env_config = dict(effective_env_config, seed=seed)
 
     # This callback logs what the AC planner reward would be for the current
     # env state. It does not replace the planner's training signal.
@@ -338,8 +505,10 @@ def run_training(
     trainer_config = {
         'env': env_class,
         'env_config': env_config,
-        'num_workers': 1,
-        'num_gpus': 0,
+        # Keep training on the local worker for notebook/local runs so Ray
+        # does not need to import this ad-hoc src module in remote actors.
+        'num_workers': 0,
+        'num_gpus': device_info['num_gpus'],
         'seed': seed,
         'train_batch_size': TRAIN_BATCH_SIZE,
         'rollout_fragment_length': ROLLOUT_FRAGMENT_LENGTH,
@@ -351,6 +520,13 @@ def run_training(
         'clip_param': 0.2,
         'vf_clip_param': 10.0,
         'entropy_coeff': 0.025,
+        'multiagent': {
+            'policies': {
+                'worker': (None, worker_obs_space, worker_action_space, {}),
+                'planner': (None, planner_obs_space, planner_action_space, {}),
+            },
+            'policy_mapping_fn': policy_mapping_fn,
+        },
     }
 
     trainer = PPO(config=trainer_config)
@@ -371,9 +547,9 @@ def run_training(
             # Get policies for eval
             try:
                 policy_dict = {
-                    str(i): trainer.get_policy(f'agent-{i}') for i in range(N_AGENTS)
+                    'worker': trainer.get_policy('worker'),
+                    'planner': trainer.get_policy('planner'),
                 }
-                policy_dict['p'] = trainer.get_policy('planner')
             except Exception:
                 policy_dict = {}
 
